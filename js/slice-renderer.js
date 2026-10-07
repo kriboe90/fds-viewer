@@ -13,7 +13,7 @@
  *   SliceUtil             — buildPlaneView, computePercentileRange, etc.
  *
  * FDS-to-Three coordinate convention used by our viewer:
- *   FDS X -> Three X,  FDS Z -> Three Y (up),  FDS Y -> Three Z
+ *   FDS X -> Three X,  FDS Z -> Three Y (up),  FDS Y -> Three -Z
  * (matches viewer.js _xbToBox)
  */
 
@@ -22,7 +22,7 @@
 
     // ── Coordinate mapping (matches viewer.js convention) ─────────────────
     function fdsToScene(x, y, z) {
-        return new THREE.Vector3(x, z, y);
+        return new THREE.Vector3(x, z, -y);
     }
 
     // ── Color maps ────────────────────────────────────────────────────────
@@ -175,6 +175,69 @@
         };
     }
 
+    /**
+     * Global min/max across the dataset's whole time series (what Smokeview's
+     * research mode shows). A per-frame percentile range collapses on typical
+     * fire slices — >98 % of cells sit at ambient, so the 2–98 % band is a
+     * fraction of a degree and the render saturates into noise. Samples up to
+     * `maxFrames` evenly spaced frames (always including first and last) and
+     * caches the result on the dataset.
+     */
+    function computeGlobalRange(dataset, maxFrames) {
+        if (dataset._globalRange) return dataset._globalRange;
+        const frameCount = dataset.frames.length;
+        const sampleCount = Math.min(frameCount, maxFrames || 60);
+        let min = Infinity, max = -Infinity;
+        for (let s = 0; s < sampleCount; s++) {
+            const index = Math.round((frameCount - 1) * s / Math.max(sampleCount - 1, 1));
+            const stats = computeStats(dataset.getFrameData(index));
+            if (stats.min < min) min = stats.min;
+            if (stats.max > max) max = stats.max;
+        }
+        dataset._globalRange = { min, max };
+        return dataset._globalRange;
+    }
+
+    /**
+     * Percentile range over the dataset's whole time series. Pools values
+     * from up to `maxFrames` evenly spaced frames (value-subsampled to keep
+     * the pool bounded), then takes the [low, high] percentiles. Useful when
+     * outlier cells stretch the global min/max so far that the interesting
+     * band loses contrast. Cached per dataset and percentile pair.
+     */
+    function computeGlobalPercentileRange(dataset, low, high, maxFrames) {
+        const cacheKey = low + ':' + high;
+        dataset._globalPercentileRanges = dataset._globalPercentileRanges || {};
+        if (dataset._globalPercentileRanges[cacheKey]) return dataset._globalPercentileRanges[cacheKey];
+
+        const frameCount = dataset.frames.length;
+        const sampleCount = Math.min(frameCount, maxFrames || 24);
+        const perFrameBudget = Math.max(1, Math.floor(2000000 / sampleCount));
+        const pool = [];
+        for (let s = 0; s < sampleCount; s++) {
+            const index = Math.round((frameCount - 1) * s / Math.max(sampleCount - 1, 1));
+            const values = dataset.getFrameData(index);
+            const stride = Math.max(1, Math.ceil(values.length / perFrameBudget));
+            for (let i = 0; i < values.length; i += stride) {
+                if (Number.isFinite(values[i])) pool.push(values[i]);
+            }
+        }
+        let range;
+        if (pool.length === 0) {
+            range = { min: NaN, max: NaN };
+        } else {
+            pool.sort((a, b) => a - b);
+            const lowIdx = Math.floor((pool.length - 1) * low);
+            const highIdx = Math.ceil((pool.length - 1) * high);
+            range = {
+                min: pool[clamp(lowIdx, 0, pool.length - 1)],
+                max: pool[clamp(highIdx, 0, pool.length - 1)],
+            };
+        }
+        dataset._globalPercentileRanges[cacheKey] = range;
+        return range;
+    }
+
     function hasUsefulRange(stats) {
         if (!Number.isFinite(stats.min) || !Number.isFinite(stats.max)) return false;
         const range = Math.abs(stats.max - stats.min);
@@ -199,6 +262,15 @@
         return min + (max - min) * index / count;
     }
 
+    /** World coordinate of grid node `index` along `axis` (0=X, 1=Y, 2=Z).
+     *  Uses the mesh's TRN node-coordinate table when available (exact, and
+     *  correct for stretched grids); falls back to linear XB interpolation. */
+    function meshAxisCoordinate(mesh, axis, index) {
+        const trn = mesh.trn && mesh.trn[axis];
+        if (trn && Number.isFinite(trn[index])) return trn[index];
+        return meshCoordinate(mesh.xb[axis * 2], mesh.xb[axis * 2 + 1], mesh.ijk[axis], index);
+    }
+
     function unionBounds(a, b) {
         return {
             x0: Math.min(a.x0, b.x0), x1: Math.max(a.x1, b.x1),
@@ -210,12 +282,12 @@
     function physicalBoundsForPart(dataset, mesh) {
         const idx = dataset.indices;
         return {
-            x0: meshCoordinate(mesh.xb[0], mesh.xb[1], mesh.ijk[0], idx.i1),
-            x1: meshCoordinate(mesh.xb[0], mesh.xb[1], mesh.ijk[0], idx.i2),
-            y0: meshCoordinate(mesh.xb[2], mesh.xb[3], mesh.ijk[1], idx.j1),
-            y1: meshCoordinate(mesh.xb[2], mesh.xb[3], mesh.ijk[1], idx.j2),
-            z0: meshCoordinate(mesh.xb[4], mesh.xb[5], mesh.ijk[2], idx.k1),
-            z1: meshCoordinate(mesh.xb[4], mesh.xb[5], mesh.ijk[2], idx.k2),
+            x0: meshAxisCoordinate(mesh, 0, idx.i1),
+            x1: meshAxisCoordinate(mesh, 0, idx.i2),
+            y0: meshAxisCoordinate(mesh, 1, idx.j1),
+            y1: meshAxisCoordinate(mesh, 1, idx.j2),
+            z0: meshAxisCoordinate(mesh, 2, idx.k1),
+            z1: meshAxisCoordinate(mesh, 2, idx.k2),
         };
     }
 
@@ -298,6 +370,36 @@
 
     function sliceGroupKey(info) { return info.chid + '::' + info.sliceIndex; }
 
+    // FDS numbers slice files per mesh: the N in CHID_M_N.sf counts only the
+    // slices that touch mesh M, so equal N on two meshes can belong to two
+    // different &SLCF lines. The .smv names the &SLCF line of every file:
+    //   SLCF  M # STRUCTURED [%ID] & i1 i2 j1 j2 k1 k2 ! index cell orient
+    // followed by the file name, quantity, short name and units lines.
+    function sliceRecordsFromSmvText(text) {
+        const lines = String(text).split(/\r?\n/);
+        const records = [];
+        for (let i = 0; i < lines.length; i++) {
+            const m = /^(SLCF|SLCC|SLCT)\s+(\d+)\b(.*)$/.exec(lines[i].trim());
+            if (!m) continue;
+            const fileName = (lines[i + 1] || '').trim();
+            if (!/\.sf$/i.test(fileName)) continue;
+            // Read the bounds and the '! index ...' metadata from the end of
+            // the line: a %ID may itself contain '&' or '!'.
+            const tail = /&((?:\s+-?\d+){6})\s*(?:!\s*(\d+)(?:\s+-?\d+)*)?\s*$/.exec(m[3]);
+            records.push({
+                type: m[1],
+                meshIndex: Number(m[2]),
+                sliceIndex: tail && tail[2] !== undefined ? Number(tail[2]) : null,
+                indices: tail ? tail[1].trim().split(/\s+/).map(Number) : null,
+                fileName,
+                quantity: (lines[i + 2] || '').trim(),
+                units: (lines[i + 4] || '').trim(),
+            });
+            i += 4;
+        }
+        return records;
+    }
+
     async function readSliceHeader(file) {
         try {
             const buf = await file.slice(0, 8192).arrayBuffer();
@@ -318,32 +420,140 @@
 
     function sliceGroupLabel(group) {
         const header = group.header;
-        const fileCount = group.items.length + ' file' + (group.items.length === 1 ? '' : 's');
-        if (!header) return group.chid + ' | Slice ' + group.sliceIndex + ' | ' + fileCount;
+        const missing = group.missing ? group.missing.length : 0;
+        const fileCount = (missing ? group.items.length + ' of ' + (group.items.length + missing) + ' files'
+            : group.items.length + ' file' + (group.items.length === 1 ? '' : 's'));
+        const slice = 'Slice ' + group.sliceIndex + (group.unlisted ? ' (not in .smv)' : '');
+        if (!header) return group.chid + ' | ' + slice + ' | ' + fileCount;
         const quantity = header.quantity || 'Slice';
         const units = header.units ? ' (' + header.units + ')' : '';
         return quantity + units + ' | ' + slicePlaneLabel(header.indices) +
-            ' | Slice ' + group.sliceIndex + ' | ' + fileCount;
+            ' | ' + slice + ' | ' + fileCount;
     }
 
-    async function describeSliceGroups(files) {
-        const groupsByKey = new Map();
+    // Status suffix for a group whose .smv records name files that are not in
+    // the folder, e.g. " (1 of 2 files; missing: two_2_2.sf)".
+    function sliceGroupMissingNote(group) {
+        const missing = group && group.missing ? group.missing : [];
+        if (!missing.length) return '';
+        return ' (' + group.items.length + ' of ' + (group.items.length + missing.length) +
+            ' files; missing: ' + missing.join(', ') + ')';
+    }
+
+    // Groups files by their &SLCF line from the .smv records. Files the
+    // records do not list, or all files when the .smv lacks the global slice
+    // index, fall back to grouping by the file-name index. When the records
+    // are used, fallback groups are marked unlisted: their file-name index is
+    // per mesh and need not match the .smv slice numbers. Groups whose files
+    // are all missing are not loadable; they are pushed to `unavailable`.
+    function groupRunFiles(files, records, runChid, groupsByKey, unavailable) {
+        const grouped = new Set();
+        const useRecords = records.length > 0 && records.every(r => r.sliceIndex !== null);
+        if (records.length && !useRecords)
+            console.info('Slice grouping' + (runChid ? ' (' + runChid + '.smv)' : '') + ': ' +
+                records.filter(r => r.sliceIndex === null).length + ' of ' +
+                records.length + ' .smv slice records lack the global slice index after "!"; ' +
+                'grouping all slice files by the CHID_M_N.sf file-name index instead.');
+        if (useRecords) {
+            const byName = new Map(files.map(f => [f.name.split(/[\\/]/).pop(), f]));
+            const runGroups = new Map();
+            for (const rec of records) {
+                const parsed = parseSliceFilename(rec.fileName);
+                const chid = runChid || (parsed ? parsed.chid : '');
+                const key = chid + '::smv::' + rec.sliceIndex + '::' + rec.quantity;
+                if (!runGroups.has(key))
+                    runGroups.set(key, { key, chid, sliceIndex: rec.sliceIndex, items: [], missing: [], header: null, label: '' });
+                const file = byName.get(rec.fileName);
+                if (!file) { runGroups.get(key).missing.push(rec.fileName); continue; }
+                grouped.add(file);
+                runGroups.get(key).items.push({
+                    file, info: { chid, meshIndex: rec.meshIndex, sliceIndex: rec.sliceIndex },
+                });
+            }
+            for (const [key, group] of runGroups) {
+                if (group.items.length === 0) unavailable.push(group);
+                else groupsByKey.set(key, group);
+            }
+        }
         for (const file of files) {
+            if (grouped.has(file)) continue;
             const info = parseSliceFilename(file.name);
             if (!info) continue;
-            const key = sliceGroupKey(info);
+            const key = (useRecords ? 'unlisted::' : '') + sliceGroupKey(info);
             if (!groupsByKey.has(key))
-                groupsByKey.set(key, { key, chid: info.chid, sliceIndex: info.sliceIndex, items: [], header: null, label: '' });
+                groupsByKey.set(key, { key, chid: info.chid, sliceIndex: info.sliceIndex, items: [], header: null, label: '', unlisted: useRecords });
             groupsByKey.get(key).items.push({ file, info });
         }
+    }
+
+    // The run a slice file belongs to: the run whose .smv lists it; for a
+    // file no .smv lists, the CHID whose 'CHID_' prefixes the file name, the
+    // longest one when several do. A run with an empty CHID matches any file.
+    // `listedBy` maps a file name to the runs whose records list it.
+    function runForSliceFile(fileName, runs, listedBy) {
+        const base = fileName.split(/[\\/]/).pop();
+        const listing = listedBy.get(base) || [];
+        if (listing.length) return runByChidPrefix(base, listing) || listing[0];
+        return runByChidPrefix(base, runs);
+    }
+
+    function runByChidPrefix(base, runs) {
+        let best = null;
+        for (const run of runs) {
+            const chid = run.chid || '';
+            if (chid && !base.startsWith(chid + '_')) continue;
+            if (!best || chid.length > (best.chid || '').length) best = run;
+        }
+        return best;
+    }
+
+    // Groups slice files of one or more runs. `runs` is [{ chid, records }],
+    // one entry per .smv (chid = .smv base name); each file is grouped with
+    // the records of its own run, and files of no run by file name.
+    async function describeSliceGroupsForRuns(files, runs) {
+        const groupsByKey = new Map();
+        const unavailable = [];
+        const filesByRun = new Map();
+        const runList = runs || [];
+        const listedBy = new Map();
+        for (const run of runList)
+            for (const rec of run.records || []) {
+                if (!listedBy.has(rec.fileName)) listedBy.set(rec.fileName, []);
+                if (!listedBy.get(rec.fileName).includes(run)) listedBy.get(rec.fileName).push(run);
+            }
+        for (const file of files) {
+            const run = runForSliceFile(file.name, runList, listedBy);
+            if (!filesByRun.has(run)) filesByRun.set(run, []);
+            filesByRun.get(run).push(file);
+        }
+        for (const run of runList)
+            groupRunFiles(filesByRun.get(run) || [], run.records || [], run.chid || '', groupsByKey, unavailable);
+        if (filesByRun.has(null))
+            groupRunFiles(filesByRun.get(null), [], '', groupsByKey, unavailable);
+        if (unavailable.length)
+            console.info('Slice grouping: not loadable, no files in the folder: ' +
+                unavailable.map(g => (g.chid ? g.chid + ' ' : '') + 'Slice ' + g.sliceIndex +
+                    ': 0 of ' + g.missing.length + ' files (missing: ' + g.missing.join(', ') + ')').join('; '));
         const groups = Array.from(groupsByKey.values()).sort(
-            (a, b) => a.chid.localeCompare(b.chid) || a.sliceIndex - b.sliceIndex);
+            (a, b) => a.chid.localeCompare(b.chid) || a.sliceIndex - b.sliceIndex ||
+                Number(a.unlisted) - Number(b.unlisted));
+        // Name the run when the folder holds more than one CHID, counting
+        // every supplied run whether or not it has loadable slices.
+        const chids = new Set(groups.map(g => g.chid));
+        for (const run of runList) if (run.chid) chids.add(run.chid);
+        const multiRun = chids.size > 1;
         for (const group of groups) {
             group.items.sort((a, b) => a.info.meshIndex - b.info.meshIndex);
             group.header = await readSliceHeader(group.items[0].file);
-            group.label = sliceGroupLabel(group);
+            group.label = (multiRun && group.header ? group.chid + ' | ' : '') + sliceGroupLabel(group);
         }
+        groups.unavailable = unavailable;
         return groups;
+    }
+
+    // Groups slice files of a single run with the records of its .smv.
+    function describeSliceGroups(files, smvRecords) {
+        return describeSliceGroupsForRuns(files, smvRecords ? [{ chid: '', records: smvRecords }] : []);
     }
 
     // ── Multi-mesh stitching ──────────────────────────────────────────────
@@ -371,17 +581,16 @@
             ? fdsContext.meshes[part.meshIndex - 1]
             : null;
         if (!mesh || !mesh.ijk || !mesh.xb) return null;
-        const [xb1, xb2, yb1, yb2, zb1, zb2] = mesh.xb;
-        const [ni, nj, nk] = mesh.ijk;
         const idx = ds.indices;
         // Convert per-mesh integer indices → world coordinates
-        const xMin = xb1 + (xb2 - xb1) * idx.i1 / ni;
-        const xMax = xb1 + (xb2 - xb1) * idx.i2 / ni;
-        const yMin = yb1 + (yb2 - yb1) * idx.j1 / nj;
-        const yMax = yb1 + (yb2 - yb1) * idx.j2 / nj;
-        const zMin = zb1 + (zb2 - zb1) * idx.k1 / nk;
-        const zMax = zb1 + (zb2 - zb1) * idx.k2 / nk;
-        return { xMin, xMax, yMin, yMax, zMin, zMax };
+        return {
+            xMin: meshAxisCoordinate(mesh, 0, idx.i1),
+            xMax: meshAxisCoordinate(mesh, 0, idx.i2),
+            yMin: meshAxisCoordinate(mesh, 1, idx.j1),
+            yMax: meshAxisCoordinate(mesh, 1, idx.j2),
+            zMin: meshAxisCoordinate(mesh, 2, idx.k1),
+            zMax: meshAxisCoordinate(mesh, 2, idx.k2),
+        };
     }
 
     function combinedIndices(indices, dims) {
@@ -500,6 +709,7 @@
 
                 if (unique.length === 1) {
                     // All parts described the same physical plane — return the lone dataset.
+                    unique[0].part.dataset.sourceMeshIndex = unique[0].part.meshIndex;
                     return unique[0].part.dataset;
                 }
 
@@ -514,13 +724,10 @@
                 const xVaries = (ranges.xMin.max - ranges.xMin.min) > KEY_PRECISION || (ranges.xMax.max - ranges.xMax.min) > KEY_PRECISION;
                 const yVaries = (ranges.yMin.max - ranges.yMin.min) > KEY_PRECISION || (ranges.yMax.max - ranges.yMax.min) > KEY_PRECISION;
                 const zVaries = (ranges.zMin.max - ranges.zMin.min) > KEY_PRECISION || (ranges.zMax.max - ranges.zMax.min) > KEY_PRECISION;
-                let axis = -1;
-                if (xVaries && !yVaries && !zVaries) axis = 0;
-                else if (!xVaries && yVaries && !zVaries) axis = 1;
-                else if (!xVaries && !yVaries && zVaries) axis = 2;
-                // Only attempt simple 1D stitching. 2D arrangements (rare for
-                // a single slice plane) fall through to the legacy path below.
-                if (axis >= 0) {
+                const varying = [xVaries, yVaries, zVaries];
+                const varyingAxes = [0, 1, 2].filter(a => varying[a]);
+                if (varyingAxes.length === 1) {
+                    const axis = varyingAxes[0];
                     // Sort parts along the stitch axis so the concatenation
                     // matches physical order regardless of file ordering.
                     const sortKey = axis === 0 ? 'xMin' : (axis === 1 ? 'yMin' : 'zMin');
@@ -528,7 +735,13 @@
                     const orderedParts = unique.map(u => u.part);
                     return _stitchOnAxis(orderedParts, axis);
                 }
-                // Fall through to legacy stitching for 2D / unknown cases
+                if (varyingAxes.length === 2) {
+                    // Meshes tile the slice plane in 2D (rows × columns),
+                    // e.g. a 4×2 mesh arrangement cut by one horizontal slice.
+                    const stitched = _stitch2DGrid(unique, varyingAxes[0], varyingAxes[1], KEY_PRECISION);
+                    if (stitched) return stitched;
+                }
+                // Fall through to legacy stitching for unknown cases
             }
         }
 
@@ -559,6 +772,100 @@
             displayName: parts[0].fileName.replace(/_\d+_(\d+)\.sf$/i, '_all_$1.sf'),
             getFrameData(frameIndex) { return stitchFrame(parts, frameIndex, axis, dims); },
         };
+    }
+
+    /** Assemble parts that tile the slice plane in a 2D grid. `placed` is the
+     *  deduplicated [{ part, fp }] list; `axisA`/`axisB` are the two varying
+     *  axes (0=I/X, 1=J/Y, 2=K/Z). Rows are formed along axisB and each row is
+     *  stitched along axisA, then the row results are stitched along axisB.
+     *  Returns null when the parts don't form a complete rectangular grid, so
+     *  the caller can fall back to legacy stitching. */
+    function _stitch2DGrid(placed, axisA, axisB, tolerance) {
+        const minKeys = ['xMin', 'yMin', 'zMin'];
+        const rowsByStart = new Map();
+        for (const p of placed) {
+            const key = Math.round(p.fp[minKeys[axisB]] / tolerance) * tolerance;
+            if (!rowsByStart.has(key)) rowsByStart.set(key, []);
+            rowsByStart.get(key).push(p);
+        }
+        const rows = Array.from(rowsByStart.keys()).sort((a, b) => a - b)
+            .map(k => rowsByStart.get(k).sort((a, b) => a.fp[minKeys[axisA]] - b.fp[minKeys[axisA]]));
+
+        // Every row must have the same columns at the same positions.
+        const colCount = rows[0].length;
+        if (rows.length * colCount !== placed.length) return null;
+        for (const row of rows) {
+            if (row.length !== colCount) return null;
+            for (let c = 0; c < colCount; c++) {
+                if (Math.abs(row[c].fp[minKeys[axisA]] - rows[0][c].fp[minKeys[axisA]]) > tolerance) return null;
+            }
+        }
+
+        try {
+            const rowParts = rows.map(row => ({
+                dataset: _stitchOnAxis(row.map(u => u.part), axisA),
+                fileName: row[0].part.fileName,
+                meshIndex: row[0].part.meshIndex,
+            }));
+            const combined = _stitchOnAxis(rowParts, axisB);
+            // Expose the flat per-mesh parts (not the synthetic row datasets)
+            // so physical placement can union the real mesh footprints.
+            combined.parts = placed.map(p => p.part);
+            return combined;
+        } catch (e) {
+            console.warn('2D slice stitching failed, falling back to legacy stitching.', e);
+            return null;
+        }
+    }
+
+    // ── FDS context from a Smokeview (.smv) file ──────────────────────────
+    // The .smv is written by FDS itself, so its GRID / PDIM / TRN records are
+    // the authoritative description of the grid the simulation actually ran
+    // on. The .fds input can disagree (edited after the run, MULT expansion,
+    // stretched grids), which mis-places and mis-sizes slices, so a context
+    // built from the .smv is preferred over one parsed from the .fds.
+    function parseSmvTrnAxis(lines, start, nodeCount) {
+        // TRN block layout: a count of stretch entries, that many stretch
+        // lines, then nodeCount+1 lines of "index coordinate".
+        let s = start;
+        const stretchCount = parseInt((lines[s] || '').trim(), 10);
+        s += 1 + (Number.isFinite(stretchCount) && stretchCount > 0 ? stretchCount : 0);
+        const coords = [];
+        for (; s < lines.length && coords.length <= nodeCount; s++) {
+            const m = /^\s*(\d+)\s+([-+0-9.Ee]+)\s*$/.exec(lines[s]);
+            if (!m) break;
+            coords[Number(m[1])] = Number(m[2]);
+        }
+        return coords.length === nodeCount + 1 && coords.every(Number.isFinite) ? coords : null;
+    }
+
+    function fdsContextFromSmvText(text, fileName) {
+        const lines = String(text).split(/\r?\n/);
+        const meshes = [];
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (!line.startsWith('GRID')) continue;
+            const id = line.replace(/^GRID\s*/i, '').trim() || 'mesh_' + (meshes.length + 1);
+            const ijk = (lines[i + 1] || '').trim().split(/\s+/).map(Number).filter(Number.isFinite).slice(0, 3);
+            if (ijk.length < 3) continue;
+            let xb = null;
+            const trn = [null, null, null];
+            for (let s = i + 2; s < lines.length; s++) {
+                const keyword = lines[s].trim();
+                if (keyword.startsWith('GRID')) break;
+                if (keyword === 'PDIM') {
+                    const values = (lines[s + 1] || '').trim().split(/\s+/).map(Number).filter(Number.isFinite);
+                    if (values.length >= 6) xb = values.slice(0, 6);
+                } else if (/^TRN[XYZ]$/.test(keyword)) {
+                    const axis = { TRNX: 0, TRNY: 1, TRNZ: 2 }[keyword];
+                    trn[axis] = parseSmvTrnAxis(lines, s + 1, ijk[axis]);
+                }
+                if (xb && trn[0] && trn[1] && trn[2]) break;
+            }
+            if (xb) meshes.push({ id, ijk, xb, trn });
+        }
+        if (meshes.length === 0) return null;
+        return { fileName: fileName || 'smv', meshes, source: 'smv' };
     }
 
     // ── FDS context from our parser's data ────────────────────────────────
@@ -819,13 +1126,17 @@
     // ── Public API ────────────────────────────────────────────────────────
     global.SliceOverlay = SliceOverlay;
     global.SliceFiles = {
-        parseSliceFilename, sliceGroupKey, describeSliceGroups,
+        parseSliceFilename, sliceGroupKey, describeSliceGroups, describeSliceGroupsForRuns,
+        sliceRecordsFromSmvText, sliceGroupMissingNote,
         combineSliceDatasets,
         fdsContextFromParsedData,
+        fdsContextFromSmvText,
     };
     global.SliceColorMap = { colorMap, COLOR_MAPS };
     global.SliceUtil = {
         buildPlaneView, extractPlaneValues, makeTextureCanvas,
-        computeStats, computePercentileRange, findInitialFrame, hasUsefulRange,
+        computeStats, computePercentileRange, computeGlobalRange,
+        computeGlobalPercentileRange,
+        findInitialFrame, hasUsefulRange,
     };
 })(window);
